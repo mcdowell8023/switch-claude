@@ -1,0 +1,1107 @@
+#!/usr/bin/env bash
+# switch-claude — keep several Claude Code accounts on one machine and switch
+# between them without logging in again.
+#
+# Two kinds of slot:
+#   oauth  the credential Claude Code gets from /login (access + refresh token).
+#          Switching installs it where Claude Code reads it: the macOS Keychain
+#          (plus ~/.claude/.credentials.json), or that file on Linux.
+#   token  a long-lived token from `claude setup-token`. Switching writes it to an
+#          env file as CLAUDE_CODE_OAUTH_TOKEN, which shells and services source.
+#
+# Slots are listed in ~/.config/switch-claude/slots.conf; their secrets live in the
+# Keychain (service "switch-claude") on macOS, or ~/.config/switch-claude/creds/ on
+# Linux. Run `switch-claude help` for commands.
+set -euo pipefail
+
+VERSION="0.1.0"
+
+CLAUDE_JSON="$HOME/.claude.json"
+CREDS_FILE="$HOME/.claude/.credentials.json"
+CONFIG_DIR="${SWITCH_CLAUDE_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/switch-claude}"
+SLOTS_FILE="$CONFIG_DIR/slots.conf"
+SETTINGS_FILE="$CONFIG_DIR/config"
+CREDS_DIR="$CONFIG_DIR/creds"
+PENDING_FILE="$CONFIG_DIR/pending"
+
+# Claude Code stores the active login under this service with the login user name
+# as the account.
+KC_DEFAULT="Claude Code-credentials"
+KC_DEFAULT_ACCOUNT="${KC_DEFAULT_ACCOUNT:-${USER:-$(id -un)}}"
+KC_SLOT_SERVICE="switch-claude"
+
+RESERVED="status list add remove rename login save sync refresh cancel backup restore help version"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+case "${SWITCH_CLAUDE_PLATFORM:-}" in
+  macos|linux) PLATFORM="$SWITCH_CLAUDE_PLATFORM" ;;
+  "") if [[ "$(uname -s)" == Darwin ]]; then PLATFORM=macos; else PLATFORM=linux; fi ;;
+  *) die "SWITCH_CLAUDE_PLATFORM must be 'macos' or 'linux'" ;;
+esac
+
+# --- settings ----------------------------------------------------------------------
+
+setting() {  # key default
+  local v=""
+  if [[ -f "$SETTINGS_FILE" ]]; then
+    v=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$SETTINGS_FILE" | tail -n 1 | sed 's/[[:space:]]*$//')
+  fi
+  [[ -n "$v" ]] || v="$2"
+  # A literal "~" from the config file, expanded here on purpose.
+  # shellcheck disable=SC2088
+  case "$v" in
+    "~") v="$HOME" ;;
+    "~/"*) v="$HOME/${v#\~/}" ;;
+  esac
+  printf '%s' "$v"
+}
+
+TOKEN_ENV_FILE=$(setting token_env_file "$CONFIG_DIR/token.env")
+BACKUP_DIR=$(setting backup_dir "${XDG_STATE_HOME:-$HOME/.local/state}/switch-claude/backups")
+POST_SWITCH_HOOK=$(setting post_switch_hook "")
+PROBE_MODEL=$(setting probe_model "claude-haiku-4-5-20251001")
+LOGIN_ARGS=$(setting login_args "")
+
+ensure_config_dir() {
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR"
+}
+
+# --- slots.conf --------------------------------------------------------------------
+# One slot per line: <name> <type> <email|-> <uuid|->. '#' starts a comment.
+
+conf_lines_of() {
+  [[ -f "$1" ]] || return 0
+  awk '!/^[[:space:]]*(#|$)/ {print $1, $2, ($3 == "" ? "-" : $3), ($4 == "" ? "-" : $4)}' "$1"
+}
+slot_lines() { conf_lines_of "$SLOTS_FILE"; }
+slot_names() { slot_lines | awk '{print $1}'; }
+slot_names_of_type() { slot_lines | awk -v t="$1" '$2 == t {print $1}'; }
+slot_field() { slot_lines | awk -v n="$1" -v f="$2" '$1 == n {print $f; exit}'; }
+slot_exists() { [[ -n "$1" && -n "$(slot_field "$1" 1)" ]]; }
+slot_type() { slot_field "$1" 2; }
+dash_empty() { [[ "$1" == "-" ]] && return 0; printf '%s' "$1"; }
+slot_email() { dash_empty "$(slot_field "$1" 3)"; }
+slot_uuid() { dash_empty "$(slot_field "$1" 4)"; }
+
+oauth_slot_by_email() {
+  local n
+  [[ -n "$1" ]] || return 1
+  n=$(slot_lines | awk -v e="$1" '$2 == "oauth" && $3 == e {print $1; exit}')
+  [[ -n "$n" ]] && printf '%s' "$n"
+}
+
+any_slot_by_email() {
+  local n
+  [[ -n "$1" ]] || return 1
+  n=$(slot_lines | awk -v e="$1" '$3 == e {print $1; exit}')
+  [[ -n "$n" ]] && printf '%s' "$n"
+}
+
+# Replace the line for <match> (or append) with the given fields, keeping comments
+# and order.
+conf_put() {  # match name type email uuid
+  local line tmp
+  ensure_config_dir
+  line=$(printf '%-12s %-6s %-36s %s' "$2" "$3" "${4:--}" "${5:--}")
+  tmp=$(mktemp "$CONFIG_DIR/.slots.XXXXXX")
+  if [[ -f "$SLOTS_FILE" ]]; then
+    awk -v n="$1" -v line="$line" '
+      /^[[:space:]]*(#|$)/ {print; next}
+      $1 == n {if (!done) print line; done = 1; next}
+      {print}
+      END {if (!done) print line}' "$SLOTS_FILE" > "$tmp"
+  else
+    { printf '%-12s %-6s %-36s %s\n' "# name" "type" "email" "uuid"; printf '%s\n' "$line"; } > "$tmp"
+  fi
+  chmod 600 "$tmp"
+  mv "$tmp" "$SLOTS_FILE"
+}
+
+conf_delete() {
+  local tmp
+  [[ -f "$SLOTS_FILE" ]] || return 0
+  tmp=$(mktemp "$CONFIG_DIR/.slots.XXXXXX")
+  awk -v n="$1" '/^[[:space:]]*(#|$)/ {print; next} $1 == n {next} {print}' "$SLOTS_FILE" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$SLOTS_FILE"
+}
+
+valid_name() {
+  local re='^[a-z0-9][a-z0-9_-]{0,31}$' r
+  [[ "$1" =~ $re ]] || return 1
+  for r in $RESERVED; do [[ "$1" == "$r" ]] && return 1; done
+  return 0
+}
+
+require_slot() {
+  slot_exists "$1" && return 0
+  local names
+  names=$(slot_names | tr '\n' ' ')
+  die "unknown slot '$1'. Slots: ${names:-none}"
+}
+
+# --- slot secrets ------------------------------------------------------------------
+
+store_read() {
+  if [[ "$PLATFORM" == macos ]]; then
+    security find-generic-password -s "$KC_SLOT_SERVICE" -a "$1" -w 2>/dev/null
+  else
+    [[ -f "$CREDS_DIR/$1" ]] && cat "$CREDS_DIR/$1"
+  fi
+}
+
+# The value goes to security(1) as `-w <value>`, so another process of this same user
+# could see it in ps(1). security reads a prompted password through readpassphrase(3),
+# which silently truncates past 128 bytes, so stdin is not an option; and anyone able
+# to read this argv can already run `security find-generic-password` themselves.
+store_write() {  # name value
+  if [[ "$PLATFORM" == macos ]]; then
+    security delete-generic-password -s "$KC_SLOT_SERVICE" -a "$1" >/dev/null 2>&1 || true
+    security add-generic-password -U -s "$KC_SLOT_SERVICE" -a "$1" -w "$2"
+  else
+    local tmp
+    ensure_config_dir
+    mkdir -p "$CREDS_DIR"
+    chmod 700 "$CREDS_DIR"
+    tmp=$(mktemp "$CREDS_DIR/.tmp.XXXXXX")
+    printf '%s\n' "$2" > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$CREDS_DIR/$1"
+  fi
+  [[ "$(store_read "$1" || true)" == "$2" ]] || die "could not verify what was written for slot $1"
+}
+
+store_delete() {
+  if [[ "$PLATFORM" == macos ]]; then
+    security delete-generic-password -s "$KC_SLOT_SERVICE" -a "$1" >/dev/null 2>&1 || true
+  else
+    rm -f "$CREDS_DIR/$1"
+  fi
+}
+
+# --- the active oauth login ------------------------------------------------------------
+
+creds_tool() {  # mode creds
+  CREDS_JSON="$2" python3 - "$1" <<'PYEOF'
+import hashlib
+import json
+import os
+import sys
+import time
+
+mode, raw = sys.argv[1], os.environ["CREDS_JSON"]
+if mode == "fingerprint":
+    print(hashlib.sha256(raw.encode()).hexdigest())
+    sys.exit(0)
+try:
+    o = json.loads(raw).get("claudeAiOauth") or {}
+    if not isinstance(o, dict):
+        raise ValueError
+except Exception:
+    if mode == "state":
+        print("invalid 0")
+        sys.exit(0)
+    sys.exit(1)
+
+now = time.time()
+access_left = (o.get("expiresAt") or 0) / 1000 - now
+refresh_left = (o.get("refreshTokenExpiresAt") or 0) / 1000 - now if o.get("refreshTokenExpiresAt") else 0
+complete = bool(o.get("accessToken") and o.get("refreshToken"))
+
+if mode == "has-token":
+    sys.exit(0 if complete else 1)
+if mode == "usable":
+    sys.exit(0 if complete and (access_left > 60 or refresh_left > 60) else 1)
+if mode == "refresh-valid":
+    sys.exit(0 if o.get("refreshToken") and refresh_left > 60 else 1)
+if mode == "access-token":
+    if complete and access_left > 60:
+        print(o["accessToken"])
+        sys.exit(0)
+    sys.exit(1)
+if mode == "state":
+    if not complete:
+        print("invalid 0")
+    elif access_left > 60:
+        print(f"ok {access_left / 3600:.1f}")
+    elif refresh_left > 60:
+        print(f"refreshable {refresh_left / 3600:.1f}")
+    else:
+        print(f"expired {access_left / 3600:.1f}")
+PYEOF
+}
+
+creds_has_token() { creds_tool has-token "$1"; }
+creds_usable() { creds_tool usable "$1"; }
+creds_fingerprint() { creds_tool fingerprint "$1"; }
+
+active_read() {
+  local v=""
+  if [[ "$PLATFORM" == macos ]]; then
+    v=$(security find-generic-password -s "$KC_DEFAULT" -a "$KC_DEFAULT_ACCOUNT" -w 2>/dev/null || true)
+    if [[ -n "$v" ]] && creds_has_token "$v"; then
+      printf '%s\n' "$v"
+      return 0
+    fi
+  fi
+  [[ -f "$CREDS_FILE" ]] || return 1
+  v=$(cat "$CREDS_FILE")
+  [[ -n "$v" ]] || return 1
+  printf '%s\n' "$v"
+}
+
+write_creds_file() {
+  mkdir -p "$(dirname "$CREDS_FILE")"
+  (umask 177; printf '%s\n' "$1" > "$CREDS_FILE")
+  chmod 600 "$CREDS_FILE"
+}
+
+active_write() {
+  if [[ "$PLATFORM" == macos ]]; then
+    security add-generic-password -U -s "$KC_DEFAULT" -a "$KC_DEFAULT_ACCOUNT" -w "$1"
+  fi
+  write_creds_file "$1"
+}
+
+active_clear() {
+  if [[ "$PLATFORM" == macos ]]; then
+    security delete-generic-password -s "$KC_DEFAULT" -a "$KC_DEFAULT_ACCOUNT" >/dev/null 2>&1 || true
+  fi
+  rm -f "$CREDS_FILE"
+}
+
+claude_json_field() {
+  [[ -f "$CLAUDE_JSON" ]] || return 0
+  CLAUDE_JSON="$CLAUDE_JSON" python3 - "$1" <<'PYEOF'
+import json
+import os
+import sys
+
+try:
+    d = json.load(open(os.environ["CLAUDE_JSON"]))
+except Exception:
+    sys.exit(0)
+print((d.get("oauthAccount") or {}).get(sys.argv[1], ""))
+PYEOF
+}
+current_email() { claude_json_field emailAddress; }
+current_uuid() { claude_json_field accountUuid; }
+
+# Claude Code refetches the profile on its own; this only keeps the account shown in
+# ~/.claude.json from lying in the meantime.
+set_oauth_account() {  # uuid email
+  CLAUDE_JSON="$CLAUDE_JSON" ACCOUNT_UUID="$1" EMAIL_ADDRESS="$2" python3 <<'PYEOF'
+import json
+import os
+
+path = os.environ["CLAUDE_JSON"]
+try:
+    d = json.load(open(path))
+except Exception:
+    d = {}
+oa = d.get("oauthAccount") or {}
+if os.environ["ACCOUNT_UUID"]:
+    oa["accountUuid"] = os.environ["ACCOUNT_UUID"]
+else:
+    oa.pop("accountUuid", None)
+oa["emailAddress"] = os.environ["EMAIL_ADDRESS"]
+d["oauthAccount"] = oa
+with open(path, "w") as f:
+    json.dump(d, f, indent=2)
+PYEOF
+}
+
+# Name of the oauth slot holding the active credential; "-" when logged out, "?" when
+# the credential is in no slot.
+active_oauth_slot() {
+  local creds n
+  creds=$(active_read 2>/dev/null) || { echo "-"; return 0; }
+  for n in $(slot_names_of_type oauth); do
+    [[ "$(store_read "$n" || true)" == "$creds" ]] && { echo "$n"; return 0; }
+  done
+  echo "?"
+}
+
+# Before anything overwrites the active login, file it in its own slot. A login that
+# belongs to no slot and still works is refused rather than dropped: a switch used to
+# skip it without a word, and the only copy of that account was gone.
+save_current_back() {
+  local creds current n slot_creds
+  creds=$(active_read 2>/dev/null) || return 0
+  creds_has_token "$creds" || return 0
+  current=$(current_email)
+
+  # Already stored under another slot: nothing is lost, whatever the metadata says.
+  for n in $(slot_names_of_type oauth); do
+    slot_creds=$(store_read "$n" || true)
+    if [[ -n "$slot_creds" && "$slot_creds" == "$creds" && "$current" != "$(slot_email "$n")" ]]; then
+      return 0
+    fi
+  done
+
+  if n=$(oauth_slot_by_email "$current"); then
+    # Claude Code refreshes in place and only ever writes the active location, and a
+    # refresh voids the previous token, so the slot copy goes stale unless stored back.
+    [[ "$(store_read "$n" || true)" == "$creds" ]] || store_write "$n" "$creds"
+    return 0
+  fi
+
+  if creds_usable "$creds"; then
+    echo "ERROR: the current login '${current:-unknown}' is not in any slot; refusing to overwrite it." >&2
+    echo "  Keep it:  switch-claude add <name>" >&2
+    echo "  Drop it:  run /logout in Claude Code first, then retry" >&2
+    return 1
+  fi
+}
+
+# --- token env file ----------------------------------------------------------------
+
+token_env_read() {
+  [[ -f "$TOKEN_ENV_FILE" ]] || return 0
+  sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}CLAUDE_CODE_OAUTH_TOKEN=//p' "$TOKEN_ENV_FILE" \
+    | tail -n 1 | tr -d "\"' \r"
+}
+
+token_env_write() {  # value ("" turns token mode off)
+  local dir tmp
+  dir=$(dirname "$TOKEN_ENV_FILE")
+  mkdir -p "$dir"
+  tmp=$(mktemp "$dir/.token-env.XXXXXX")
+  printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$1" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$TOKEN_ENV_FILE"
+}
+
+active_token_slot() {  # prints the token slot whose token is in the env file, "?" if none
+  local t n
+  t=$(token_env_read)
+  [[ -n "$t" ]] || return 1
+  for n in $(slot_names_of_type token); do
+    [[ "$(store_read "$n" || true)" == "$t" ]] && { echo "$n"; return 0; }
+  done
+  echo "?"
+}
+
+# Same rule as save_current_back, for a token that only exists in the env file.
+guard_env_token_saved() {
+  local s
+  s=$(active_token_slot) || return 0
+  [[ "$s" != "?" ]] && return 0
+  echo "ERROR: $TOKEN_ENV_FILE holds a token that is not in any slot; refusing to overwrite it." >&2
+  echo "  Keep it:  switch-claude add <name> --token < \"$TOKEN_ENV_FILE\"" >&2
+  return 1
+}
+
+# An empty assignment, not an empty file: Claude Code treats an empty
+# CLAUDE_CODE_OAUTH_TOKEN as unset, and the assignment also overrides a stale value a
+# new shell may inherit from its parent (tmux, a terminal app).
+turn_off_token_mode() {
+  [[ -n "$(token_env_read)" ]] || return 0
+  token_env_write ""
+  echo "  Token mode turned off: $TOKEN_ENV_FILE no longer sets CLAUDE_CODE_OAUTH_TOKEN."
+  echo "  Shells and services started before this keep the old value: open a new shell, restart them."
+}
+
+warn_shell_env_token() {
+  [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] || return 0
+  [[ "$CLAUDE_CODE_OAUTH_TOKEN" == "$(token_env_read)" ]] && return 0
+  echo "WARNING: this shell has CLAUDE_CODE_OAUTH_TOKEN set and it does not match $TOKEN_ENV_FILE."
+  echo "  It overrides every oauth slot for anything started from this shell. Open a new shell, or unset it."
+}
+
+# --- probing -----------------------------------------------------------------------
+
+# One tiny real request; the bearer token goes to curl through its stdin config so it
+# never appears in argv. Prints "<http>|<5h util>|<5h reset>|<7d util>".
+probe() {
+  local hdr
+  hdr=$(mktemp)
+  printf 'header = "Authorization: Bearer %s"\n' "$1" \
+    | curl -s -o /dev/null -D "$hdr" -K - --max-time 20 -X POST "https://api.anthropic.com/v1/messages" \
+        -H "anthropic-version: 2023-06-01" -H "anthropic-beta: oauth-2025-04-20" -H "content-type: application/json" \
+        -d "{\"model\":\"$PROBE_MODEL\",\"max_tokens\":8,\"system\":\"You are Claude Code, Anthropic's official CLI for Claude.\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" \
+    >/dev/null 2>&1 || true
+  python3 - "$hdr" <<'PYEOF'
+import re
+import sys
+import time
+
+h = open(sys.argv[1], errors="replace").read()
+def get(name):
+    m = re.search(name + r":\s*([^\r\n]+)", h, re.I)
+    return m.group(1).strip() if m else "-"
+status = re.findall(r"^HTTP/[\d.]+ (\d+)", h, re.M)
+reset = get("anthropic-ratelimit-unified-5h-reset")
+try:
+    reset = time.strftime("%m-%d %H:%M", time.localtime(int(reset)))
+except ValueError:
+    pass
+print("%s|%s|%s|%s" % (status[-1] if status else "no-response", get("anthropic-ratelimit-unified-5h-utilization"),
+                       reset, get("anthropic-ratelimit-unified-7d-utilization")))
+PYEOF
+  rm -f "$hdr"
+}
+
+probe_summary() {  # probe output
+  local code u5 r5 u7
+  IFS='|' read -r code u5 r5 u7 <<< "$1"
+  printf 'HTTP %s · 5h %s (resets %s) · 7d %s' "$code" "$u5" "$r5" "$u7"
+}
+
+# --- pending login -----------------------------------------------------------------
+
+write_pending() {  # target fingerprint
+  ensure_config_dir
+  (umask 177; printf '{"target": "%s", "fingerprint": "%s"}\n' "$1" "$2" > "$PENDING_FILE")
+  chmod 600 "$PENDING_FILE"
+}
+
+pending_field() {
+  [[ -f "$PENDING_FILE" ]] || return 1
+  python3 - "$PENDING_FILE" "$1" <<'PYEOF'
+import json
+import sys
+
+print(json.load(open(sys.argv[1]))[sys.argv[2]])
+PYEOF
+}
+
+clear_pending() { rm -f "$PENDING_FILE"; }
+
+# --- hooks -------------------------------------------------------------------------
+
+run_post_switch_hook() {  # slot type
+  [[ -n "$POST_SWITCH_HOOK" ]] || return 0
+  if [[ ! -x "$POST_SWITCH_HOOK" ]]; then
+    echo "WARNING: post_switch_hook '$POST_SWITCH_HOOK' is not executable; skipped." >&2
+    return 0
+  fi
+  local rc=0
+  SWITCH_CLAUDE_SLOT="$1" SWITCH_CLAUDE_TYPE="$2" SWITCH_CLAUDE_TOKEN_ENV_FILE="$TOKEN_ENV_FILE" \
+    "$POST_SWITCH_HOOK" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    echo "ERROR: post-switch hook failed (exit $rc). The switch itself is done." >&2
+    exit 4
+  fi
+}
+
+# --- backup ------------------------------------------------------------------------
+
+assert_not_in_git() {
+  local probe="$1"
+  while [[ -n "$probe" && "$probe" != "/" ]]; do
+    if [[ -e "$probe/.git" ]]; then
+      die "backup dir '$1' is inside a git work tree ($probe); refusing to write plaintext credentials there."
+    fi
+    probe=$(dirname "$probe")
+  done
+}
+
+# Prints the snapshot directory. Snapshots hold plaintext credentials.
+do_backup() {  # [reason]
+  local snap n v state
+  assert_not_in_git "$BACKUP_DIR"
+  mkdir -p "$BACKUP_DIR"
+  chmod 700 "$BACKUP_DIR"
+  snap=$(mktemp -d "$BACKUP_DIR/$(date +%Y%m%d-%H%M%S)${1:+-$1}-XXXX")
+  chmod 700 "$snap"
+  (
+    umask 177
+    [[ -f "$SLOTS_FILE" ]] && cp "$SLOTS_FILE" "$snap/slots.conf"
+    [[ -f "$SETTINGS_FILE" ]] && cp "$SETTINGS_FILE" "$snap/config"
+    {
+      echo "switch-claude backup — $(date '+%Y-%m-%d %H:%M:%S %Z') — $PLATFORM"
+      echo "Files ending in .secret hold plaintext credentials. This manifest holds none."
+      echo
+    } > "$snap/MANIFEST.txt"
+    for n in $(slot_names); do
+      v=$(store_read "$n" || true)
+      if [[ -z "$v" ]]; then
+        echo "slot $n ($(slot_type "$n")): empty" >> "$snap/MANIFEST.txt"
+        continue
+      fi
+      printf '%s\n' "$v" > "$snap/slot-$n.secret"
+      state="token"
+      [[ "$(slot_type "$n")" == oauth ]] && state=$(creds_tool state "$v")
+      printf 'slot %s (%s, %s): sha256 %s, %s\n' "$n" "$(slot_type "$n")" "$(slot_email "$n")" \
+        "$(creds_fingerprint "$v" | cut -c1-12)" "$state" >> "$snap/MANIFEST.txt"
+    done
+    if v=$(active_read 2>/dev/null); then
+      printf '%s\n' "$v" > "$snap/active-oauth.secret"
+      printf 'active oauth login (%s): sha256 %s\n' "$(current_email)" "$(creds_fingerprint "$v" | cut -c1-12)" >> "$snap/MANIFEST.txt"
+    fi
+    v=$(token_env_read)
+    if [[ -n "$v" ]]; then
+      printf '%s\n' "$v" > "$snap/token-env.secret"
+      printf 'token env file %s: sha256 %s\n' "$TOKEN_ENV_FILE" "$(creds_fingerprint "$v" | cut -c1-12)" >> "$snap/MANIFEST.txt"
+    fi
+  )
+  printf '%s\n' "$snap"
+}
+
+# --- commands ----------------------------------------------------------------------
+
+cmd_status() {
+  local do_probe=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --probe) do_probe=1 ;;
+      *) die "unknown option for status: $arg" ;;
+    esac
+  done
+
+  if [[ -z "$(slot_names)" ]]; then
+    echo "No slots configured yet."
+    echo "  Add the current login:    switch-claude add <name>"
+    echo "  Add a long-lived token:   switch-claude add <name> --token"
+    warn_shell_env_token
+    return 0
+  fi
+
+  local token active mode
+  token=$(token_env_read)
+  if [[ -n "$token" ]]; then
+    mode=token
+    active=$(active_token_slot)
+  else
+    mode=oauth
+    active=$(active_oauth_slot)
+  fi
+
+  echo "Mode: $mode"
+  case "$active" in
+    "-") echo "Active slot: none (logged out)" ;;
+    "?") echo "Active slot: none — the active $mode credential is not in any slot" ;;
+    *) echo "Active slot: $active" ;;
+  esac
+  echo "Login on record: $(current_email)"
+  if [[ -n "$token" ]]; then
+    echo "Token env file: $TOKEN_ENV_FILE (sets CLAUDE_CODE_OAUTH_TOKEN)"
+  fi
+  if [[ -f "$PENDING_FILE" ]]; then
+    echo "Pending login: $(pending_field target 2>/dev/null || echo unreadable)"
+  fi
+  warn_shell_env_token
+  echo
+  echo "Slots:"
+
+  local name type email mark v state hours extra access
+  while read -r name type email _; do
+    mark=" "
+    [[ "$name" == "$active" ]] && mark="*"
+    v=$(store_read "$name" || true)
+    extra=""
+    if [[ "$type" == token ]]; then
+      if [[ -z "$v" ]]; then
+        state="✗ empty — re-add it: switch-claude add $name --token"
+      else
+        state="token stored"
+        [[ "$do_probe" -eq 1 ]] && extra=" · $(probe_summary "$(probe "$v")")"
+      fi
+    elif [[ -z "$v" ]]; then
+      state="✗ empty — switch-claude login $name"
+    else
+      read -r state hours < <(creds_tool state "$v")
+      case "$state" in
+        ok) state="✓ access valid for ${hours}h" ;;
+        refreshable) state="access expired; refresh CLAIMS ${hours}h left (UNVERIFIED)" ;;
+        expired) state="✗ expired — switch-claude login $name" ;;
+        *) state="✗ unreadable" ;;
+      esac
+      if [[ "$do_probe" -eq 1 ]]; then
+        if access=$(creds_tool access-token "$v"); then
+          extra=" · $(probe_summary "$(probe "$access")")"
+        else
+          extra=" · not probed (access expired; probing would need a refresh)"
+        fi
+      fi
+    fi
+    printf '%s %-10s %-5s  %-32s %s%s\n' "$mark" "$name" "$type" "$email" "$state" "$extra"
+  done < <(slot_lines)
+}
+
+cmd_list() {
+  local name type email _
+  while read -r name type email _; do
+    printf '%-12s %-6s %s\n' "$name" "$type" "$email"
+  done < <(slot_lines)
+}
+
+read_token_input() {
+  local tok=""
+  if [[ -t 0 ]]; then
+    read -r -s -p "Paste the token (from 'claude setup-token'): " tok || true
+    echo >&2
+  else
+    IFS= read -r tok || true
+  fi
+  tok="${tok%$'\r'}"
+  tok="${tok#"${tok%%[![:space:]]*}"}"
+  tok="${tok%"${tok##*[![:space:]]}"}"
+  tok="${tok#export }"
+  tok="${tok#CLAUDE_CODE_OAUTH_TOKEN=}"
+  tok="${tok#\"}"; tok="${tok%\"}"
+  printf '%s' "$tok"
+}
+
+cmd_add() {
+  local name="${1:-}" email="" kind=oauth
+  [[ -n "$name" ]] || die "usage: switch-claude add <name> [--email <email>] [--token]"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --email) email="${2:-}"; [[ -n "$email" ]] || die "--email needs a value"; shift 2 ;;
+      --token) kind=token; shift ;;
+      *) die "unknown option for add: $1" ;;
+    esac
+  done
+  valid_name "$name" || die "invalid slot name '$name': use a-z 0-9 _ - (max 32), and not a command name"
+  slot_exists "$name" && die "slot '$name' already exists"
+  [[ "$email" != *[[:space:]]* ]] || die "invalid email '$email'"
+
+  local n
+  if [[ "$kind" == token ]]; then
+    local tok
+    tok=$(read_token_input)
+    [[ ${#tok} -ge 40 && "$tok" != *[[:space:]]* ]] || die "that does not look like a token from 'claude setup-token'"
+    for n in $(slot_names_of_type token); do
+      [[ "$(store_read "$n" || true)" == "$tok" ]] && die "this token is already stored in slot $n"
+    done
+    store_write "$name" "$tok"
+    conf_put "$name" "$name" token "${email:--}" -
+    echo "✓ Added slot $name (token)"
+    return 0
+  fi
+
+  if [[ -n "$email" ]]; then
+    n=$(any_slot_by_email "$email") && die "$email is already slot $n"
+    conf_put "$name" "$name" oauth "$email" -
+    echo "✓ Registered slot $name (oauth, $email) — no credentials yet."
+    echo "  Log in with: switch-claude login $name"
+    return 0
+  fi
+
+  local creds current
+  creds=$(active_read 2>/dev/null) || die "no active login to capture. Run /login first, or register an empty slot: switch-claude add $name --email <email>"
+  creds_has_token "$creds" || die "no active login to capture (the active credential is incomplete)"
+  creds_usable "$creds" || die "the active login is expired; log in again before adding it"
+  for n in $(slot_names_of_type oauth); do
+    [[ "$(store_read "$n" || true)" == "$creds" ]] && die "the current login is already stored in slot $n"
+  done
+  current=$(current_email)
+  [[ -n "$current" ]] || die "cannot tell which account is logged in (~/.claude.json has no email)"
+  n=$(oauth_slot_by_email "$current") && die "$current is already slot $n; to update it: switch-claude save $n"
+  store_write "$name" "$creds"
+  conf_put "$name" "$name" oauth "$current" "$(current_uuid)"
+  echo "✓ Added slot $name (oauth, $current)"
+}
+
+cmd_remove() {
+  local name="${1:-}" snap was=""
+  [[ -n "$name" ]] || die "usage: switch-claude remove <name>"
+  require_slot "$name"
+  if [[ "$(slot_type "$name")" == oauth ]]; then
+    [[ "$(active_oauth_slot)" == "$name" ]] && was=oauth
+  else
+    [[ "$(active_token_slot || true)" == "$name" ]] && was=token
+  fi
+  snap=$(do_backup "remove-$name")
+  store_delete "$name"
+  conf_delete "$name"
+  [[ "$(pending_field target 2>/dev/null || true)" == "$name" ]] && clear_pending
+  echo "✓ Removed slot $name (backup: $snap)"
+  if [[ "$was" == oauth ]]; then
+    echo "  It was the active login. The login stays in place but is no longer in any slot,"
+    echo "  so switching away is refused until you add it back or /logout."
+  elif [[ "$was" == token ]]; then
+    echo "  Its token is still in $TOKEN_ENV_FILE; switch to another slot to stop using it."
+  fi
+}
+
+cmd_rename() {
+  local old="${1:-}" new="${2:-}" v target
+  [[ -n "$old" && -n "$new" ]] || die "usage: switch-claude rename <old> <new>"
+  require_slot "$old"
+  valid_name "$new" || die "invalid slot name '$new': use a-z 0-9 _ - (max 32), and not a command name"
+  slot_exists "$new" && die "slot '$new' already exists"
+  if v=$(store_read "$old"); then
+    store_write "$new" "$v"
+    store_delete "$old"
+  fi
+  conf_put "$old" "$new" "$(slot_type "$old")" "$(slot_field "$old" 3)" "$(slot_field "$old" 4)"
+  if target=$(pending_field target 2>/dev/null) && [[ "$target" == "$old" ]]; then
+    write_pending "$new" "$(pending_field fingerprint)"
+  fi
+  echo "✓ Renamed slot $old → $new"
+}
+
+prepare_login() {  # name
+  local name="$1" email fp
+  email=$(slot_email "$name")
+  save_current_back || die "could not save the current login; aborting."
+  guard_env_token_saved || exit 1
+  fp=$(creds_fingerprint "$(active_read 2>/dev/null || true)")
+  write_pending "$name" "$fp"
+  active_clear
+  echo "→ Prepared a fresh login for $name ($email)"
+  turn_off_token_mode
+  echo
+  echo "Run /login in Claude Code."
+  echo "Log in as: $email"
+  echo "Then run:  switch-claude save"
+}
+
+cmd_login() {
+  local name="${1:-}" no_browser=0
+  [[ -n "$name" ]] || die "usage: switch-claude login <name> [--no-browser]"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-browser) no_browser=1; shift ;;
+      *) die "unknown option for login: $1" ;;
+    esac
+  done
+  require_slot "$name"
+  [[ "$(slot_type "$name")" == oauth ]] || die "$name is a token slot; token slots are added with: switch-claude add <name> --token"
+  [[ -n "$(slot_email "$name")" ]] || die "slot $name has no email recorded"
+  prepare_login "$name"
+  if [[ "$no_browser" -eq 1 ]]; then
+    local email
+    email=$(slot_email "$name")
+    echo
+    echo "Starting: claude auth login --claudeai ${LOGIN_ARGS:+$LOGIN_ARGS }--email $email"
+    # shellcheck disable=SC2086
+    env -u CLAUDE_CODE_OAUTH_TOKEN BROWSER=true claude auth login --claudeai $LOGIN_ARGS --email "$email"
+  fi
+}
+
+other_slot_with_creds() {  # exclude creds → name of another oauth slot holding these creds
+  local n
+  for n in $(slot_names_of_type oauth); do
+    [[ "$n" == "$1" ]] && continue
+    [[ "$(store_read "$n" || true)" == "$2" ]] && { printf '%s' "$n"; return 0; }
+  done
+  return 1
+}
+
+maybe_update_uuid() {  # name
+  local u
+  u=$(current_uuid)
+  [[ -n "$u" && "$u" != "$(slot_uuid "$1")" ]] || return 0
+  conf_put "$1" "$1" oauth "$(slot_field "$1" 3)" "$u"
+}
+
+complete_pending_login() {
+  local target fp email creds other actual
+  target=$(pending_field target 2>/dev/null) || die "pending login state is unreadable; clear it with: switch-claude cancel"
+  fp=$(pending_field fingerprint 2>/dev/null || true)
+  if ! slot_exists "$target" || [[ "$(slot_type "$target")" != oauth ]]; then
+    clear_pending
+    die "unknown pending login target '$target'; the pending state was cleared"
+  fi
+  email=$(slot_email "$target")
+  creds=$(active_read 2>/dev/null || true)
+  if [[ -z "$creds" ]] || ! creds_has_token "$creds"; then
+    die "Pending login for $target is incomplete: no credentials yet. Run /login in Claude Code as $email, then: switch-claude save  (give up: switch-claude cancel)"
+  fi
+  if other=$(other_slot_with_creds "$target" "$creds"); then
+    echo "ERROR: the active credentials still match $other; refusing to save them as $target." >&2
+    echo "  Starting the login over." >&2
+    prepare_login "$target"
+    return 0
+  fi
+  [[ "$(creds_fingerprint "$creds")" != "$fp" ]] || die "credentials have not changed since 'switch-claude login $target' — finish /login first"
+  actual=$(current_email)
+  [[ "$actual" == "$email" ]] || die "logged-in account is '${actual:-unknown}'; expected '$email'. Run /login again as $email."
+  creds_usable "$creds" || die "the new login for $target is already expired"
+  store_write "$target" "$creds"
+  maybe_update_uuid "$target"
+  clear_pending
+  echo "✓ Saved fresh login into $target ($email)"
+}
+
+cmd_sync() {
+  local creds email n
+  creds=$(active_read 2>/dev/null) || die "no active login to store"
+  creds_has_token "$creds" || die "the active credential is incomplete; refusing to store it"
+  email=$(current_email)
+  n=$(oauth_slot_by_email "$email") || die "current login '${email:-unknown}' is not a known slot. Add it: switch-claude add <name>"
+  if [[ "$(store_read "$n" || true)" == "$creds" ]]; then
+    echo "  slot $n is already current; nothing to do"
+    return 0
+  fi
+  store_write "$n" "$creds"
+  maybe_update_uuid "$n"
+  echo "✓ Stored the current credentials back into slot $n ($email)"
+}
+
+cmd_save() {
+  local name="${1:-}"
+  if [[ -f "$PENDING_FILE" ]]; then
+    complete_pending_login
+    return 0
+  fi
+  [[ -n "$name" ]] || { cmd_sync; return 0; }
+  require_slot "$name"
+  [[ "$(slot_type "$name")" == oauth ]] || die "$name is a token slot; nothing to save"
+  local creds email actual other
+  email=$(slot_email "$name")
+  creds=$(active_read 2>/dev/null) || die "no active login to save"
+  creds_has_token "$creds" || die "the active credential is incomplete; refusing to save it"
+  actual=$(current_email)
+  [[ "$actual" == "$email" ]] || die "logged-in account is '${actual:-unknown}'; expected '$email'"
+  if other=$(other_slot_with_creds "$name" "$creds"); then
+    die "the active credentials match slot $other; refusing to save them as $name"
+  fi
+  creds_usable "$creds" || die "the active login is expired; log in again first"
+  store_write "$name" "$creds"
+  maybe_update_uuid "$name"
+  echo "✓ Saved the current login into $name ($email)"
+}
+
+switch_oauth() {  # name force
+  local name="$1" force="$2" creds email
+  email=$(slot_email "$name")
+  creds=$(store_read "$name" || true)
+  [[ -n "$creds" ]] || die "slot $name has no credentials yet. Log in with: switch-claude login $name"
+  if [[ "$force" -eq 0 ]] && ! creds_usable "$creds"; then
+    # An expired access token alone is fine: it only lives ~8h and Claude Code trades
+    # the refresh token for a new one on the first request. Both dead means nothing
+    # can be exchanged.
+    die "cached credentials for $name are fully expired (access and refresh). Log in again: switch-claude login $name  (or --force to install them anyway)"
+  fi
+  save_current_back || die "could not save the current login; aborting."
+  guard_env_token_saved || exit 1
+  active_write "$creds"
+  set_oauth_account "$(slot_uuid "$name")" "$email"
+  clear_pending
+  echo "✓ Switched to $name ($email)"
+  turn_off_token_mode
+  warn_shell_env_token
+}
+
+switch_token() {  # name force
+  local name="$1" force="$2" tok res code u5 r5 u7 answer
+  tok=$(store_read "$name" || true)
+  [[ -n "$tok" ]] || die "slot $name has no token stored. Re-add it: switch-claude remove $name && switch-claude add $name --token"
+  guard_env_token_saved || exit 1
+  if [[ "$force" -eq 0 ]]; then
+    res=$(probe "$tok")
+    IFS='|' read -r code u5 r5 u7 <<< "$res"
+    case "$code" in
+      200) ;;
+      429)
+        if [[ -t 0 ]]; then
+          read -r -p "$name is rate-limited (HTTP 429, 5h resets $r5). Switch anyway? [y/N] " answer || true
+          [[ "$answer" == y || "$answer" == Y ]] || { echo "Cancelled."; exit 1; }
+        else
+          die "$name is rate-limited (HTTP 429, 5h resets $r5). Use --force to switch anyway."
+        fi
+        ;;
+      *) die "the token for $name was rejected (HTTP $code). Use --force to switch anyway." ;;
+    esac
+  fi
+  token_env_write "$tok"
+  echo "✓ Switched to $name (token)"
+  echo "  $TOKEN_ENV_FILE now sets CLAUDE_CODE_OAUTH_TOKEN. New shells pick it up;"
+  echo "  restart long-running services (see post_switch_hook)."
+}
+
+cmd_switch() {
+  local name="$1" force=0
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  require_slot "$name"
+  case "$(slot_type "$name")" in
+    oauth) switch_oauth "$name" "$force" ;;
+    token) switch_token "$name" "$force" ;;
+    *) die "slot $name has an unknown type '$(slot_type "$name")' in $SLOTS_FILE" ;;
+  esac
+  run_post_switch_hook "$name" "$(slot_type "$name")"
+}
+
+refresh_one() {  # name
+  local name="$1" email creds before saved saved_email refreshed state hours
+  email=$(slot_email "$name")
+  save_current_back || { echo "ERROR: could not save the current login; aborting refresh." >&2; return 1; }
+  creds=$(store_read "$name" || true)
+  [[ -n "$creds" ]] || { echo "Skipping $name: no cached credentials"; return 0; }
+  read -r state hours < <(creds_tool state "$creds")
+  if [[ "$state" == ok ]]; then
+    echo "Skipping $name: access token still valid (${hours}h), nothing to refresh"
+    return 0
+  fi
+  creds_tool refresh-valid "$creds" || { echo "Skipping $name: refresh token expired or missing — switch-claude login $name"; return 0; }
+
+  echo "Refreshing $name ($email)"
+  before=$(creds_fingerprint "$creds")
+  saved=$(active_read 2>/dev/null || true)
+  saved_email=$(current_email)
+  active_write "$creds"
+  set_oauth_account "$(slot_uuid "$name")" "$email"
+
+  # `claude auth status` only reads local state and never refreshes; a real request
+  # does. A rate-limit rejection still performs the refresh, so its exit code says
+  # nothing. The env token is dropped so the call really uses these credentials.
+  env -u CLAUDE_CODE_OAUTH_TOKEN claude -p "ok" </dev/null >/dev/null 2>&1 || true
+
+  refreshed=$(active_read 2>/dev/null || true)
+  if [[ -z "$refreshed" || "$(creds_fingerprint "$refreshed")" == "$before" ]]; then
+    echo "ERROR: credentials for $name are byte-identical after the refresh — it did not happen." >&2
+    echo "  The slot still holds the old token. Re-login: switch-claude login $name" >&2
+    restore_login "$saved" "$saved_email"
+    return 1
+  fi
+  store_write "$name" "$refreshed"
+  echo "✓ Refreshed $name"
+  echo "  The previous token is now void: any other machine still holding it must get this one."
+  restore_login "$saved" "$saved_email"
+}
+
+restore_login() {  # creds email — put back what was active before a refresh
+  local n uuid=""
+  if [[ -z "$1" ]]; then
+    active_clear
+    return 0
+  fi
+  active_write "$1"
+  if n=$(oauth_slot_by_email "$2"); then uuid=$(slot_uuid "$n"); fi
+  set_oauth_account "$uuid" "$2"
+}
+
+cmd_refresh() {
+  local target="${1:-}" n
+  [[ -n "$target" ]] || die "usage: switch-claude refresh <name>|--all"
+  if [[ "$target" == --all ]]; then
+    for n in $(slot_names_of_type oauth); do
+      refresh_one "$n"
+    done
+    return 0
+  fi
+  require_slot "$target"
+  if [[ "$(slot_type "$target")" == token ]]; then
+    echo "Skipping $target: token slot (long-lived, nothing to refresh)"
+    return 0
+  fi
+  refresh_one "$target"
+}
+
+cmd_cancel() {
+  local t
+  if [[ -f "$PENDING_FILE" ]]; then
+    t=$(pending_field target 2>/dev/null || echo unknown)
+    clear_pending
+    echo "Cancelled pending login for $t"
+    [[ "$(active_oauth_slot)" == "-" ]] && echo "  You are logged out; switch back with: switch-claude <name>"
+  else
+    echo "No pending login to cancel"
+  fi
+  return 0
+}
+
+cmd_backup() {
+  local snap
+  snap=$(do_backup)
+  echo "✓ Backup written: $snap"
+  echo "  It holds plaintext credentials — keep it out of git and sync folders."
+}
+
+cmd_restore() {
+  local snap="${1:-}" apply=0 wanted="" arg name type email uuid secret count=0
+  [[ -n "$snap" ]] || die "usage: switch-claude restore <snapshot-dir> [--apply] [name ...]"
+  shift
+  for arg in "$@"; do
+    case "$arg" in
+      --apply) apply=1 ;;
+      -*) die "unknown option for restore: $arg" ;;
+      *) wanted="$wanted $arg" ;;
+    esac
+  done
+  [[ -d "$snap" && -f "$snap/slots.conf" ]] || die "$snap is not a switch-claude snapshot"
+  if [[ "$apply" -eq 1 ]]; then
+    echo "Restoring slots from $snap"
+  else
+    echo "DRY RUN — nothing is written. Add --apply to restore."
+  fi
+  while read -r name type email uuid; do
+    if [[ -n "$wanted" && " $wanted " != *" $name "* ]]; then continue; fi
+    secret="$snap/slot-$name.secret"
+    [[ -f "$secret" ]] || { echo "  skip $name: no secret in this snapshot"; continue; }
+    valid_name "$name" || { echo "  skip $name: invalid name"; continue; }
+    if [[ "$apply" -eq 1 ]]; then
+      store_write "$name" "$(cat "$secret")"
+      conf_put "$name" "$name" "$type" "$email" "$uuid"
+      echo "  ✓ restored $name ($type, $email)"
+    else
+      echo "  would restore $name ($type, $email)$(slot_exists "$name" && echo " — replaces the current slot")"
+    fi
+    count=$((count + 1))
+  done < <(conf_lines_of "$snap/slots.conf")
+  echo "$count slot(s)."
+  echo "The active login and the token env file are never touched by restore."
+}
+
+cmd_help() {
+  cat <<EOF
+switch-claude $VERSION — keep several Claude Code accounts and switch between them
+
+Usage:
+  switch-claude [status] [--probe]    show slots and which one is active
+                                      (--probe: one tiny real request per slot,
+                                       shows HTTP status and 5h / 7d usage)
+  switch-claude <name> [--force]      switch to a slot
+  switch-claude list                  list slots (name, type, email)
+
+  switch-claude add <name>            store the current login as a new oauth slot
+  switch-claude add <name> --email E  register an empty oauth slot, then 'login' it
+  switch-claude add <name> --token    store a 'claude setup-token' token (read
+                                      from stdin or a hidden prompt) [--email E]
+  switch-claude rename <old> <new>
+  switch-claude remove <name>         (backs up first)
+
+  switch-claude login <name> [--no-browser]
+                                      log in again to refresh a slot; finish with
+  switch-claude save                  … which also stores rotated credentials back
+  switch-claude save <name>           store the current login into that slot
+  switch-claude sync                  same as plain 'save' without a pending login
+  switch-claude refresh <name>|--all  trade an expired access token for a new one
+  switch-claude cancel                drop a pending login
+
+  switch-claude backup
+  switch-claude restore <dir> [--apply] [name ...]
+
+Files:
+  $SLOTS_FILE
+  $SETTINGS_FILE    (token_env_file, post_switch_hook, backup_dir, login_args, probe_model)
+EOF
+}
+
+# --- main --------------------------------------------------------------------------
+
+cmd="${1:-status}"
+[[ $# -gt 0 ]] && shift
+case "$cmd" in
+  status) cmd_status "$@" ;;
+  list) cmd_list ;;
+  add) cmd_add "$@" ;;
+  remove) cmd_remove "$@" ;;
+  rename) cmd_rename "$@" ;;
+  login) cmd_login "$@" ;;
+  save) cmd_save "$@" ;;
+  sync) cmd_sync ;;
+  refresh) cmd_refresh "$@" ;;
+  cancel) cmd_cancel ;;
+  backup) cmd_backup ;;
+  restore) cmd_restore "$@" ;;
+  help|-h|--help) cmd_help ;;
+  version|--version) echo "switch-claude $VERSION" ;;
+  -*) die "unknown option: $cmd (see: switch-claude help)" ;;
+  *) cmd_switch "$cmd" "$@" ;;
+esac

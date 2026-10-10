@@ -1,0 +1,20 @@
+# ~/.config/switch-claude/config — every key is optional. `key = value`, one per line.
+
+# Where token slots are written as CLAUDE_CODE_OAUTH_TOKEN=... when you switch to one.
+# Shells and services must source this file; see "Token slots" in the README.
+# token_env_file = ~/.config/switch-claude/token.env
+
+# Executable run after every successful switch (gets SWITCH_CLAUDE_SLOT,
+# SWITCH_CLAUDE_TYPE, SWITCH_CLAUDE_TOKEN_ENV_FILE). Example: examples/hooks/.
+# post_switch_hook = ~/.config/switch-claude/hooks/paseo-restart.sh
+
+# Snapshots written by `backup` and before every `remove`. Plaintext credentials:
+# keep it outside git work trees and synced folders.
+# backup_dir = ~/.local/state/switch-claude/backups
+
+# Extra arguments for `claude auth login` used by `login <name> --no-browser`,
+# e.g. --sso when your organization signs in through SSO.
+# login_args = --sso
+
+# Model used by `status --probe` (one request with max_tokens=8 per slot).
+# probe_model = claude-haiku-4-5-20251001
