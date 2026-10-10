@@ -311,7 +311,9 @@ assert_absent() {
 
 assert_mode() {
   local m
-  m=$(stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1")
+  # GNU stat first: GNU `stat -f` means "file system status" and happily prints
+  # something else instead of failing.
+  m=$(stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1")
   [[ "$m" == "$2" ]] || { printf 'Expected mode %s on %s, got %s\n' "$2" "$1" "$m" >&2; return 1; }
 }
 
