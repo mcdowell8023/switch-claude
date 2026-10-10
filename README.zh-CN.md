@@ -149,12 +149,15 @@ EnvironmentFile=-%h/.config/switch-claude/token.env
 2. 不在任何插槽里、而且仍然有效的登录，绝不覆盖；命令会停下，并告诉你怎么保存或丢弃。只存在于 token 环境文件里的 token 同样处理。
 3. `save` 拒绝邮箱和插槽对不上的凭据，也拒绝和其他插槽逐字节相同的凭据。
 4. access token 过期的 oauth 插槽照样可以切过去，第一次请求时会用 refresh token 换新。只有两个都过期了，才要求加 `--force`。
+5. 插槽里较新的凭据不会被较旧的覆盖。轮换只会让过期时间往后推，当前登录比插槽里那份过期得还早，就说明它不是这个插槽的最新版本（常见于 `~/.claude.json` 记错了账号），这时切换直接停下。
+6. 读取失败（Keychain 被锁、权限不够）按错误处理，绝不当成「空」。`remove` 确认备份里确实有这个插槽之后才删除，`restore --apply` 会先备份它要覆盖的插槽。
+7. token 只接受 40 个以上 `A-Z a-z 0-9 . _ -` 字符组成的字符串，因为环境文件会被 shell 加载执行。
 
 ## 注意事项
 
 - **一个插槽只在一台机器上用。** 两台机器共用同一账号时，一边刷新，另一边那份就作废了。第二台机器改用 token 插槽（`claude setup-token`）。
 - `refreshTokenExpiresAt` 只是 token 自己声称的有效期。已经被轮换作废的 token 在本地看起来仍然有效，所以 `status` 标成「CLAIMS … UNVERIFIED」。用 `status --probe` 或者直接切过去，才能知道它是不是真的还能用。
-- macOS 上写 Keychain 时，凭据作为参数传给 `security`，在那一瞬间**同一用户**的其他进程能从 `ps` 看到。`security` 读不了 stdin 传入的长值；而同一用户本来就能直接读取这条 Keychain 记录。
+- 凭据通过 stdin 传给辅助进程，不经过环境变量。macOS 上写 Keychain 时，凭据作为参数传给 `security`，在那一瞬间**同一用户**的其他进程能从 `ps` 看到。`security` 读不了 stdin 传入的长值；而同一用户本来就能直接读取这条 Keychain 记录。
 - 备份里是明文凭据，`backup_dir` 不要放进 git 仓库或同步文件夹。
 - `status --probe` 和切到 token 插槽时，会向 `api.anthropic.com` 发一个真实请求（max_tokens 8）。
 - 这是个人维护的独立工具，与 Anthropic 无关。它依赖 Claude Code 目前存放凭据的方式，这一点将来可能会变。

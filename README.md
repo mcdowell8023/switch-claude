@@ -149,12 +149,15 @@ If you already have such an env file, point `token_env_file` at it instead of mo
 2. A login that is in no slot and still works is never overwritten; the command stops and says how to keep or drop it. The same holds for a token that only exists in the token env file.
 3. `save` refuses credentials whose email does not match the slot, and credentials that are byte-identical to another slot's.
 4. An oauth slot whose access token expired is still switchable, because the refresh token gets a new one on the first request. Only when both are expired does it ask for `--force`.
+5. An older credential never replaces a newer one in a slot. Rotation only moves the expiry forward, so an active login that expires earlier than its slot's copy is not that slot's latest. This happens when `~/.claude.json` names the wrong account. The switch stops instead.
+6. Reads that fail (locked Keychain, permissions) are errors, never "empty". `remove` deletes only after the backup provably holds the slot, and `restore --apply` backs up the slots it replaces.
+7. Tokens are accepted only as 40+ characters of `A-Z a-z 0-9 . _ -`, because the env file gets sourced by shells.
 
 ## Caveats
 
 - **One machine per slot.** If two machines use the same account and one refreshes, the other's copy is dead. Use a token slot (`claude setup-token`) on the second machine instead.
 - `refreshTokenExpiresAt` is only what a token says about itself. A rotated-away token still looks valid locally, so `status` labels it "CLAIMS … UNVERIFIED". Use `status --probe` (or just switch) to find out.
-- On macOS the Keychain write passes the secret as an argument to `security`, so another process of **your own user** could see it in `ps` for a moment. `security` cannot read a long value from stdin, and that same user can read the Keychain item directly anyway.
+- Credentials are passed to helper processes on stdin, never in environment variables. On macOS the Keychain write passes the secret as an argument to `security`, so another process of **your own user** could see it in `ps` for a moment. `security` cannot read a long value from stdin, and that same user can read the Keychain item directly anyway.
 - Backups contain plaintext credentials. Keep `backup_dir` out of git and synced folders.
 - `status --probe` and token switches send a real request (max_tokens 8) to `api.anthropic.com`.
 - This is an independent tool, not affiliated with Anthropic. It relies on where Claude Code currently stores credentials, which may change.

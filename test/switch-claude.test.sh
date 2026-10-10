@@ -36,6 +36,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 mkdir -p "$KEYCHAIN_DIR"
+# Injected failures: a locked Keychain / denied access looks like this.
+if [[ "$cmd" == find-generic-password && -n "${MOCK_SECURITY_FAIL_FIND:-}" && "$account" == "$MOCK_SECURITY_FAIL_FIND" ]]; then exit 51; fi
+if [[ "$cmd" == add-generic-password && -n "${MOCK_SECURITY_FAIL_ADD:-}" && "$account" == "$MOCK_SECURITY_FAIL_ADD" ]]; then exit 51; fi
 case "$cmd" in
   find-generic-password)
     if [[ "$have_account" -eq 1 ]]; then
@@ -121,6 +124,13 @@ esac
 exit 0
 SH
 
+REAL_PYTHON3=$(command -v python3)
+cat > "$BIN_DIR/python3" <<SH
+#!/usr/bin/env bash
+if env | grep -q '^CREDS_JSON='; then echo "CREDS_JSON in env" >> "\$PY_ENV_LOG"; fi
+exec "$REAL_PYTHON3" "\$@"
+SH
+
 for cmd in pkill sleep; do printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN_DIR/$cmd"; done
 printf '#!/usr/bin/env bash\nexit 1\n' > "$BIN_DIR/pgrep"
 chmod +x "$BIN_DIR"/*
@@ -132,6 +142,7 @@ export XDG_STATE_HOME="$HOME/.local/state"
 export KEYCHAIN_DIR
 export CLAUDE_CALL_LOG="$TEST_HOME/claude-call.log"
 export CURL_CALL_LOG="$TEST_HOME/curl-call.log"
+export PY_ENV_LOG="$TEST_HOME/py-env.log"
 export PATH="$BIN_DIR:$PATH"
 unset CLAUDE_CODE_OAUTH_TOKEN SWITCH_CLAUDE_HOME CLAUDE_REFRESH_LABEL || true
 
@@ -179,6 +190,7 @@ dead() { creds "$1" -3600 -60; }                   # both expired
 
 reset_state() {
   rm -rf "$HOME" "$KEYCHAIN_DIR" "$CLAUDE_CALL_LOG" "$CURL_CALL_LOG"
+  unset MOCK_SECURITY_FAIL_FIND MOCK_SECURITY_FAIL_ADD || true
   mkdir -p "$HOME/.claude" "$KEYCHAIN_DIR"
   unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_REFRESH_LABEL || true
 }
@@ -961,6 +973,138 @@ test_restore_dry_run_then_apply() {
   assert_eq "$(get_slot sw)" "$b"
   assert_eq "$(conf_line sw)" "sw oauth $B_EMAIL $B_UUID"
   assert_eq "$(conf_line lw)" "lw oauth $A_EMAIL $A_UUID"
+}
+
+
+# --- F. review round 1 (2026-10-11) ---------------------------------------------------
+
+# Refreshing the slot that is currently active rotates its token. Putting the
+# pre-refresh credential back as the active login would install a voided token, and
+# the next switch would store that dead copy over the good one.
+test_refresh_of_active_slot_keeps_the_refreshed_login() {
+  two_slots
+  local a
+  a=$(refreshable alice)
+  set_slot lw "$a"; set_active "$a"
+  export CLAUDE_REFRESH_LABEL=alice
+  run_sc refresh lw >/dev/null
+  unset CLAUDE_REFRESH_LABEL
+  assert_contains "$(get_slot lw)" "access-refreshed-alice"
+  assert_eq "$(get_active)" "$(get_slot lw)"
+  run_sc sw >/dev/null
+  assert_contains "$(get_slot lw)" "access-refreshed-alice"
+}
+
+# Rotation only ever moves expiresAt forward, so an active credential that expires
+# earlier than the slot's copy is not that slot's latest; storing it would replace
+# a newer credential with an older one.
+test_older_active_credential_never_overwrites_newer_slot() {
+  two_slots
+  local newer older out
+  newer=$(creds alice-newer 7200 604800)
+  older=$(creds alice-older 1800 604800)
+  set_slot lw "$newer"; set_active "$older"
+  out=$(expect_fail sw)
+  assert_contains "$out" "newer"
+  assert_eq "$(get_slot lw)" "$newer"
+  assert_eq "$(get_active)" "$older"
+  out=$(expect_fail sync)
+  assert_eq "$(get_slot lw)" "$newer"
+}
+
+make_slot_unreadable() {
+  if [[ "$SWITCH_CLAUDE_PLATFORM" == macos ]]; then
+    export MOCK_SECURITY_FAIL_FIND="$1"
+  else
+    chmod 000 "$(slot_path "$1")"
+  fi
+}
+
+test_remove_refuses_when_slot_cannot_be_read() {
+  two_slots
+  local out
+  make_slot_unreadable sw
+  out=$(expect_fail remove sw)
+  unset MOCK_SECURITY_FAIL_FIND
+  chmod 600 "$(slot_path sw)" 2>/dev/null || true
+  [[ -n "$(get_slot sw)" ]]
+  [[ -n "$(conf_line sw)" ]]
+}
+
+test_backup_fails_when_a_slot_cannot_be_read() {
+  two_slots
+  make_slot_unreadable sw
+  local out
+  out=$(expect_fail backup)
+  assert_contains "$out" "sw"
+  # A half-written snapshot would leave plaintext copies behind.
+  [[ -z "$(ls -A "$XDG_STATE_HOME/switch-claude/backups/" 2>/dev/null)" ]] || {
+    printf 'partial snapshot left behind: %s\n' "$(ls "$XDG_STATE_HOME/switch-claude/backups/")" >&2; return 1; }
+}
+
+test_rename_refuses_when_slot_cannot_be_read() {
+  two_slots
+  make_slot_unreadable sw
+  local out
+  out=$(expect_fail rename sw bob2)
+  unset MOCK_SECURITY_FAIL_FIND
+  chmod 600 "$(slot_path sw)" 2>/dev/null || true
+  [[ -n "$(conf_line sw)" ]]
+  [[ -n "$(get_slot sw)" ]]
+}
+
+test_failed_keychain_update_keeps_old_value() {
+  [[ "$SWITCH_CLAUDE_PLATFORM" == macos ]] || return 0
+  two_slots
+  local old rotated out
+  old=$(get_slot lw)
+  rotated=$(creds alice-rotated 7200 604800)
+  set_active "$rotated"
+  export MOCK_SECURITY_FAIL_ADD=lw
+  out=$(expect_fail sync)
+  unset MOCK_SECURITY_FAIL_ADD
+  assert_eq "$(get_slot lw)" "$old"
+}
+
+# The env file is sourced by shells, so a token is only ever written if it is made
+# of characters that cannot do anything there.
+test_tokens_with_shell_metacharacters_are_refused() {
+  two_slots
+  local bad out
+  for bad in 'fake-token-$(touch /tmp/pwned)-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' \
+             'fake-token-`id`-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' \
+             'fake-token;id;AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'; do
+    if out=$(printf '%s\n' "$bad" | "$SC" add hub --token 2>&1); then
+      printf 'accepted unsafe token [%s]\n' "$bad" >&2; return 1
+    fi
+  done
+  # A slot that got an unsafe token some other way is still not written out.
+  add_token_slot evil 'fake-token-$(id)-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+  out=$(expect_fail evil --force)
+  assert_absent "$TOKEN_ENV"
+}
+
+test_restore_backs_up_slots_it_replaces() {
+  two_slots
+  local snap current out
+  run_sc backup >/dev/null
+  snap=$(ls -d "$XDG_STATE_HOME/switch-claude/backups/"* | head -n 1)
+  current=$(creds alice-current 7200 604800)
+  set_slot lw "$current"
+  out=$(run_sc restore "$snap" --apply lw)
+  assert_contains "$out" "backup"
+  [[ "$(ls -d "$XDG_STATE_HOME/switch-claude/backups/"* | wc -l | tr -d ' ')" -eq 2 ]]
+  grep -rqF "$current" "$XDG_STATE_HOME/switch-claude/backups/"
+}
+
+test_credentials_never_travel_through_the_environment() {
+  two_slots
+  add_token_slot hub "$TOKEN_OK"
+  run_sc status --probe >/dev/null
+  run_sc sw >/dev/null
+  run_sc backup >/dev/null
+  run_sc sync >/dev/null
+  assert_absent "$PY_ENV_LOG"
 }
 
 # --- runner ------------------------------------------------------------------------

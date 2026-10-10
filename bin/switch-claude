@@ -144,12 +144,30 @@ require_slot() {
 
 # --- slot secrets ------------------------------------------------------------------
 
+# Prints a slot's secret. Returns 0 when found, 1 when the slot holds none, 2 when it
+# could not be read (locked Keychain, permissions) — never treat 2 as "empty".
 store_read() {
+  local v rc=0
   if [[ "$PLATFORM" == macos ]]; then
-    security find-generic-password -s "$KC_SLOT_SERVICE" -a "$1" -w 2>/dev/null
-  else
-    [[ -f "$CREDS_DIR/$1" ]] && cat "$CREDS_DIR/$1"
+    v=$(security find-generic-password -s "$KC_SLOT_SERVICE" -a "$1" -w 2>/dev/null) || rc=$?
+    case "$rc" in
+      0) printf '%s\n' "$v"; return 0 ;;
+      44) return 1 ;;
+      *) return 2 ;;
+    esac
   fi
+  [[ -e "$CREDS_DIR/$1" ]] || return 1
+  v=$(cat "$CREDS_DIR/$1" 2>/dev/null) || return 2
+  printf '%s\n' "$v"
+}
+
+# For paths that write or delete: empty when the slot holds nothing, fatal when it
+# cannot be read. Use as a plain assignment so the failure stops the caller.
+slot_secret() {
+  local v rc=0
+  v=$(store_read "$1") || rc=$?
+  [[ "$rc" -eq 2 ]] && die "could not read the credentials of slot $1 (locked Keychain or permissions)"
+  printf '%s' "$v"
 }
 
 # The value goes to security(1) as `-w <value>`, so another process of this same user
@@ -158,8 +176,8 @@ store_read() {
 # to read this argv can already run `security find-generic-password` themselves.
 store_write() {  # name value
   if [[ "$PLATFORM" == macos ]]; then
-    security delete-generic-password -s "$KC_SLOT_SERVICE" -a "$1" >/dev/null 2>&1 || true
-    security add-generic-password -U -s "$KC_SLOT_SERVICE" -a "$1" -w "$2"
+    # -U updates in place: deleting first would lose the old value if the add failed.
+    security add-generic-password -U -s "$KC_SLOT_SERVICE" -a "$1" -w "$2" || true
   else
     local tmp
     ensure_config_dir
@@ -183,15 +201,15 @@ store_delete() {
 
 # --- the active oauth login ------------------------------------------------------------
 
-creds_tool() {  # mode creds
-  CREDS_JSON="$2" python3 - "$1" <<'PYEOF'
+# The credential goes in on stdin: an environment variable is visible to other
+# processes of the same user (ps eww, /proc/<pid>/environ).
+CREDS_PY=$(cat <<'PYEOF'
 import hashlib
 import json
-import os
 import sys
 import time
 
-mode, raw = sys.argv[1], os.environ["CREDS_JSON"]
+mode, raw = sys.argv[1], sys.stdin.read()
 if mode == "fingerprint":
     print(hashlib.sha256(raw.encode()).hexdigest())
     sys.exit(0)
@@ -221,6 +239,9 @@ if mode == "access-token":
         print(o["accessToken"])
         sys.exit(0)
     sys.exit(1)
+if mode == "expires":
+    print(int(o.get("expiresAt") or 0))
+    sys.exit(0)
 if mode == "state":
     if not complete:
         print("invalid 0")
@@ -231,6 +252,10 @@ if mode == "state":
     else:
         print(f"expired {access_left / 3600:.1f}")
 PYEOF
+)
+
+creds_tool() {  # mode creds
+  printf '%s' "$2" | python3 -c "$CREDS_PY" "$1"
 }
 
 creds_has_token() { creds_tool has-token "$1"; }
@@ -335,7 +360,7 @@ save_current_back() {
 
   # Already stored under another slot: nothing is lost, whatever the metadata says.
   for n in $(slot_names_of_type oauth); do
-    slot_creds=$(store_read "$n" || true)
+    slot_creds=$(slot_secret "$n") || return 1
     if [[ -n "$slot_creds" && "$slot_creds" == "$creds" && "$current" != "$(slot_email "$n")" ]]; then
       return 0
     fi
@@ -344,7 +369,10 @@ save_current_back() {
   if n=$(oauth_slot_by_email "$current"); then
     # Claude Code refreshes in place and only ever writes the active location, and a
     # refresh voids the previous token, so the slot copy goes stale unless stored back.
-    [[ "$(store_read "$n" || true)" == "$creds" ]] || store_write "$n" "$creds"
+    slot_creds=$(slot_secret "$n") || return 1
+    [[ "$slot_creds" == "$creds" ]] && return 0
+    refuse_older_than_slot "$n" "$slot_creds" "$creds" || return 1
+    store_write "$n" "$creds"
     return 0
   fi
 
@@ -356,6 +384,22 @@ save_current_back() {
   fi
 }
 
+# Rotation only moves expiresAt forward, so a credential expiring earlier than the
+# slot's copy is not that slot's latest. Seen when ~/.claude.json names the wrong
+# account, or after something put an old copy back: storing it would replace the
+# newer credential with an older, probably voided one.
+refuse_older_than_slot() {  # name slot_creds active_creds
+  local slot_exp active_exp
+  [[ -n "$2" ]] || return 0
+  slot_exp=$(creds_tool expires "$2" 2>/dev/null || echo 0)
+  active_exp=$(creds_tool expires "$3" 2>/dev/null || echo 0)
+  [[ "$active_exp" -ge "$slot_exp" ]] && return 0
+  echo "ERROR: slot $1 holds newer credentials than the active login (they expire later);" >&2
+  echo "  refusing to overwrite them with the older ones. Check 'switch-claude status'." >&2
+  echo "  If the active login really is the one to keep: switch-claude save $1" >&2
+  return 1
+}
+
 # --- token env file ----------------------------------------------------------------
 
 token_env_read() {
@@ -364,8 +408,16 @@ token_env_read() {
     | tail -n 1 | tr -d "\"' \r"
 }
 
+# Tokens from `claude setup-token` are plain ASCII words. Anything else is refused,
+# because the env file gets sourced by shells.
+valid_token() {
+  local re='^[A-Za-z0-9._-]{40,}$'
+  [[ "$1" =~ $re ]]
+}
+
 token_env_write() {  # value ("" turns token mode off)
   local dir tmp
+  [[ -z "$1" ]] || valid_token "$1" || die "refusing to write a token with unexpected characters to $TOKEN_ENV_FILE"
   dir=$(dirname "$TOKEN_ENV_FILE")
   mkdir -p "$dir"
   tmp=$(mktemp "$dir/.token-env.XXXXXX")
@@ -501,43 +553,48 @@ assert_not_in_git() {
 
 # Prints the snapshot directory. Snapshots hold plaintext credentials.
 do_backup() {  # [reason]
+  # Always called as $(do_backup), where bash drops errexit: turn it back on, so a
+  # failed read or copy fails the backup instead of producing a partial one.
+  set -e
   local snap n v state
   assert_not_in_git "$BACKUP_DIR"
   mkdir -p "$BACKUP_DIR"
   chmod 700 "$BACKUP_DIR"
   snap=$(mktemp -d "$BACKUP_DIR/$(date +%Y%m%d-%H%M%S)${1:+-$1}-XXXX")
   chmod 700 "$snap"
+  # The subshell runs as `( … ) || exit 1`, a condition, where errexit is off again:
+  # every step that matters checks itself.
   (
     umask 177
-    [[ -f "$SLOTS_FILE" ]] && cp "$SLOTS_FILE" "$snap/slots.conf"
-    [[ -f "$SETTINGS_FILE" ]] && cp "$SETTINGS_FILE" "$snap/config"
+    if [[ -f "$SLOTS_FILE" ]]; then cp "$SLOTS_FILE" "$snap/slots.conf" || exit 1; fi
+    if [[ -f "$SETTINGS_FILE" ]]; then cp "$SETTINGS_FILE" "$snap/config" || exit 1; fi
     {
       echo "switch-claude backup — $(date '+%Y-%m-%d %H:%M:%S %Z') — $PLATFORM"
       echo "Files ending in .secret hold plaintext credentials. This manifest holds none."
       echo
-    } > "$snap/MANIFEST.txt"
+    } > "$snap/MANIFEST.txt" || exit 1
     for n in $(slot_names); do
-      v=$(store_read "$n" || true)
+      v=$(slot_secret "$n") || exit 1
       if [[ -z "$v" ]]; then
         echo "slot $n ($(slot_type "$n")): empty" >> "$snap/MANIFEST.txt"
         continue
       fi
-      printf '%s\n' "$v" > "$snap/slot-$n.secret"
+      printf '%s\n' "$v" > "$snap/slot-$n.secret" || exit 1
       state="token"
       [[ "$(slot_type "$n")" == oauth ]] && state=$(creds_tool state "$v")
       printf 'slot %s (%s, %s): sha256 %s, %s\n' "$n" "$(slot_type "$n")" "$(slot_email "$n")" \
         "$(creds_fingerprint "$v" | cut -c1-12)" "$state" >> "$snap/MANIFEST.txt"
     done
     if v=$(active_read 2>/dev/null); then
-      printf '%s\n' "$v" > "$snap/active-oauth.secret"
+      printf '%s\n' "$v" > "$snap/active-oauth.secret" || exit 1
       printf 'active oauth login (%s): sha256 %s\n' "$(current_email)" "$(creds_fingerprint "$v" | cut -c1-12)" >> "$snap/MANIFEST.txt"
     fi
     v=$(token_env_read)
     if [[ -n "$v" ]]; then
-      printf '%s\n' "$v" > "$snap/token-env.secret"
+      printf '%s\n' "$v" > "$snap/token-env.secret" || exit 1
       printf 'token env file %s: sha256 %s\n' "$TOKEN_ENV_FILE" "$(creds_fingerprint "$v" | cut -c1-12)" >> "$snap/MANIFEST.txt"
     fi
-  )
+  ) || { rm -rf "$snap"; exit 1; }
   printf '%s\n' "$snap"
 }
 
@@ -665,7 +722,7 @@ cmd_add() {
   if [[ "$kind" == token ]]; then
     local tok
     tok=$(read_token_input)
-    [[ ${#tok} -ge 40 && "$tok" != *[[:space:]]* ]] || die "that does not look like a token from 'claude setup-token'"
+    valid_token "$tok" || die "that does not look like a token from 'claude setup-token' (expected 40+ characters of A-Z a-z 0-9 . _ -)"
     for n in $(slot_names_of_type token); do
       [[ "$(store_read "$n" || true)" == "$tok" ]] && die "this token is already stored in slot $n"
     done
@@ -707,7 +764,12 @@ cmd_remove() {
   else
     [[ "$(active_token_slot || true)" == "$name" ]] && was=token
   fi
+  local v
+  v=$(slot_secret "$name")
   snap=$(do_backup "remove-$name")
+  if [[ -n "$v" && "$(cat "$snap/slot-$name.secret" 2>/dev/null)" != "$v" ]]; then
+    die "the backup in $snap does not hold slot $name; nothing was removed"
+  fi
   store_delete "$name"
   conf_delete "$name"
   [[ "$(pending_field target 2>/dev/null || true)" == "$name" ]] && clear_pending
@@ -726,7 +788,8 @@ cmd_rename() {
   require_slot "$old"
   valid_name "$new" || die "invalid slot name '$new': use a-z 0-9 _ - (max 32), and not a command name"
   slot_exists "$new" && die "slot '$new' already exists"
-  if v=$(store_read "$old"); then
+  v=$(slot_secret "$old")
+  if [[ -n "$v" ]]; then
     store_write "$new" "$v"
     store_delete "$old"
   fi
@@ -828,10 +891,13 @@ cmd_sync() {
   creds_has_token "$creds" || die "the active credential is incomplete; refusing to store it"
   email=$(current_email)
   n=$(oauth_slot_by_email "$email") || die "current login '${email:-unknown}' is not a known slot. Add it: switch-claude add <name>"
-  if [[ "$(store_read "$n" || true)" == "$creds" ]]; then
+  local slot_creds
+  slot_creds=$(slot_secret "$n")
+  if [[ "$slot_creds" == "$creds" ]]; then
     echo "  slot $n is already current; nothing to do"
     return 0
   fi
+  refuse_older_than_slot "$n" "$slot_creds" "$creds" || exit 1
   store_write "$n" "$creds"
   maybe_update_uuid "$n"
   echo "✓ Stored the current credentials back into slot $n ($email)"
@@ -864,7 +930,7 @@ cmd_save() {
 switch_oauth() {  # name force
   local name="$1" force="$2" creds email
   email=$(slot_email "$name")
-  creds=$(store_read "$name" || true)
+  creds=$(slot_secret "$name")
   [[ -n "$creds" ]] || die "slot $name has no credentials yet. Log in with: switch-claude login $name"
   if [[ "$force" -eq 0 ]] && ! creds_usable "$creds"; then
     # An expired access token alone is fine: it only lives ~8h and Claude Code trades
@@ -884,8 +950,9 @@ switch_oauth() {  # name force
 
 switch_token() {  # name force
   local name="$1" force="$2" tok res code u5 r5 u7 answer
-  tok=$(store_read "$name" || true)
+  tok=$(slot_secret "$name")
   [[ -n "$tok" ]] || die "slot $name has no token stored. Re-add it: switch-claude remove $name && switch-claude add $name --token"
+  valid_token "$tok" || die "the token stored in slot $name has unexpected characters; refusing to use it"
   guard_env_token_saved || exit 1
   if [[ "$force" -eq 0 ]]; then
     res=$(probe "$tok")
@@ -931,7 +998,7 @@ refresh_one() {  # name
   local name="$1" email creds before saved saved_email refreshed state hours
   email=$(slot_email "$name")
   save_current_back || { echo "ERROR: could not save the current login; aborting refresh." >&2; return 1; }
-  creds=$(store_read "$name" || true)
+  creds=$(slot_secret "$name")
   [[ -n "$creds" ]] || { echo "Skipping $name: no cached credentials"; return 0; }
   read -r state hours < <(creds_tool state "$creds")
   if [[ "$state" == ok ]]; then
@@ -962,6 +1029,8 @@ refresh_one() {  # name
   store_write "$name" "$refreshed"
   echo "✓ Refreshed $name"
   echo "  The previous token is now void: any other machine still holding it must get this one."
+  # The active login was this very slot: its pre-refresh copy is the voided one.
+  [[ "$saved" == "$creds" ]] && saved="$refreshed"
   restore_login "$saved" "$saved_email"
 }
 
@@ -1027,6 +1096,15 @@ cmd_restore() {
   [[ -d "$snap" && -f "$snap/slots.conf" ]] || die "$snap is not a switch-claude snapshot"
   if [[ "$apply" -eq 1 ]]; then
     echo "Restoring slots from $snap"
+    local replaces=0 safety
+    while read -r name _; do
+      if [[ -n "$wanted" && " $wanted " != *" $name "* ]]; then continue; fi
+      [[ -f "$snap/slot-$name.secret" ]] && slot_exists "$name" && replaces=1
+    done < <(conf_lines_of "$snap/slots.conf")
+    if [[ "$replaces" -eq 1 ]]; then
+      safety=$(do_backup "before-restore")
+      echo "  The slots it replaces were backed up first: $safety"
+    fi
   else
     echo "DRY RUN — nothing is written. Add --apply to restore."
   fi
