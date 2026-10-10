@@ -1,0 +1,6 @@
+# Never commit credentials or local state
+*.json
+!test/fixtures/*.json
+*.token
+*.env
+.DS_Store
