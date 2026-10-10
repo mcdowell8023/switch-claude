@@ -87,6 +87,13 @@ PY
   else
     mkdir -p "$HOME/.claude"; printf '%s\n' "$blob" > "$HOME/.claude/.credentials.json"
   fi
+  if [[ -n "${CLAUDE_REFRESH_AS_EMAIL:-}" ]]; then
+    python3 - "$HOME/.claude.json" "$CLAUDE_REFRESH_AS_EMAIL" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1])); d["oauthAccount"]["emailAddress"] = sys.argv[2]
+json.dump(d, open(sys.argv[1], "w"))
+PY
+  fi
 fi
 exit 0
 SH
@@ -190,7 +197,7 @@ dead() { creds "$1" -3600 -60; }                   # both expired
 
 reset_state() {
   rm -rf "$HOME" "$KEYCHAIN_DIR" "$CLAUDE_CALL_LOG" "$CURL_CALL_LOG"
-  unset MOCK_SECURITY_FAIL_FIND MOCK_SECURITY_FAIL_ADD || true
+  unset MOCK_SECURITY_FAIL_FIND MOCK_SECURITY_FAIL_ADD CLAUDE_REFRESH_AS_EMAIL || true
   mkdir -p "$HOME/.claude" "$KEYCHAIN_DIR"
   unset CLAUDE_CODE_OAUTH_TOKEN CLAUDE_REFRESH_LABEL || true
 }
@@ -1105,6 +1112,59 @@ test_credentials_never_travel_through_the_environment() {
   run_sc backup >/dev/null
   run_sc sync >/dev/null
   assert_absent "$PY_ENV_LOG"
+}
+
+
+# --- G. review round 2 (2026-10-11) ---------------------------------------------------
+
+# Another Claude Code process can write its own account's refreshed credential while
+# a refresh runs; that credential must not be filed under the slot being refreshed.
+test_refresh_refuses_credentials_of_another_account() {
+  two_slots
+  set_slot sw "$(refreshable bob)"
+  local before a out
+  before=$(get_slot sw); a=$(get_active)
+  export CLAUDE_REFRESH_LABEL=other CLAUDE_REFRESH_AS_EMAIL="mallory@example.com"
+  out=$(expect_fail refresh sw)
+  unset CLAUDE_REFRESH_LABEL CLAUDE_REFRESH_AS_EMAIL
+  assert_contains "$out" "mallory@example.com"
+  assert_eq "$(get_slot sw)" "$before"
+  assert_eq "$(get_active)" "$a"
+  assert_eq "$(current_field emailAddress)" "$A_EMAIL"
+}
+
+test_status_reports_unreadable_slot() {
+  two_slots
+  make_slot_unreadable sw
+  local out
+  out=$(run_sc status)
+  unset MOCK_SECURITY_FAIL_FIND
+  chmod 600 "$(slot_path sw)" 2>/dev/null || true
+  assert_contains "$(slot_line "$out" sw)" "unreadable"
+  assert_not_contains "$(slot_line "$out" sw)" "empty"
+}
+
+test_add_refuses_when_another_slot_cannot_be_read() {
+  two_slots
+  set_active "$(fresh carol)"; set_current_email "carol@example.com"
+  make_slot_unreadable sw
+  local out
+  out=$(expect_fail add carol)
+  unset MOCK_SECURITY_FAIL_FIND
+  chmod 600 "$(slot_path sw)" 2>/dev/null || true
+  [[ -z "$(conf_line carol)" ]]
+}
+
+test_failed_active_keychain_write_aborts_switch() {
+  [[ "$SWITCH_CLAUDE_PLATFORM" == macos ]] || return 0
+  two_slots
+  local a out
+  a=$(get_active)
+  export MOCK_SECURITY_FAIL_ADD="$USER"
+  out=$(expect_fail sw)
+  unset MOCK_SECURITY_FAIL_ADD
+  assert_eq "$(get_active)" "$a"
+  assert_eq "$(current_field emailAddress)" "$A_EMAIL"
 }
 
 # --- runner ------------------------------------------------------------------------

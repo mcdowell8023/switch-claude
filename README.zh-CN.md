@@ -155,6 +155,8 @@ EnvironmentFile=-%h/.config/switch-claude/token.env
 
 ## 注意事项
 
+- **切换时最好没有别的 Claude Code 会话在跑。** 还在运行的会话之后可能刷新自己的 token，并写回到你刚切过去的登录上；下一次 `save` 或切换时，这份凭据就会被归到错误的账号下，除非刚好被上面那条过期时间规则拦住。`refresh` 运行期间如果记录的账号变了，也会停下。
+- `refresh --all` 遇到第一个失败的插槽就停，同一个问题不会在每个插槽上重复一遍。
 - **一个插槽只在一台机器上用。** 两台机器共用同一账号时，一边刷新，另一边那份就作废了。第二台机器改用 token 插槽（`claude setup-token`）。
 - `refreshTokenExpiresAt` 只是 token 自己声称的有效期。已经被轮换作废的 token 在本地看起来仍然有效，所以 `status` 标成「CLAIMS … UNVERIFIED」。用 `status --probe` 或者直接切过去，才能知道它是不是真的还能用。
 - 凭据通过 stdin 传给辅助进程，不经过环境变量。macOS 上写 Keychain 时，凭据作为参数传给 `security`，在那一瞬间**同一用户**的其他进程能从 `ps` 看到。`security` 读不了 stdin 传入的长值；而同一用户本来就能直接读取这条 Keychain 记录。

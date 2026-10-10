@@ -155,6 +155,8 @@ If you already have such an env file, point `token_env_file` at it instead of mo
 
 ## Caveats
 
+- **Switch while other Claude Code sessions are idle.** A session that keeps running may refresh its own token later and write it back over the login you just switched to. The next `save` or switch then files it under the wrong account, unless the expiry rule above catches it. `refresh` also stops if the account on record changed while it ran.
+- `refresh --all` stops at the first slot that fails, so a problem never gets repeated across every slot.
 - **One machine per slot.** If two machines use the same account and one refreshes, the other's copy is dead. Use a token slot (`claude setup-token`) on the second machine instead.
 - `refreshTokenExpiresAt` is only what a token says about itself. A rotated-away token still looks valid locally, so `status` labels it "CLAIMS … UNVERIFIED". Use `status --probe` (or just switch) to find out.
 - Credentials are passed to helper processes on stdin, never in environment variables. On macOS the Keychain write passes the secret as an argument to `security`, so another process of **your own user** could see it in `ps` for a moment. `security` cannot read a long value from stdin, and that same user can read the Keychain item directly anyway.
